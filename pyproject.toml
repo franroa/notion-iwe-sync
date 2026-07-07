@@ -1,0 +1,16 @@
+[project]
+name = "notion-iwe-sync"
+version = "0.1.0"
+description = "Mirror a personal Notion workspace as a local IWE markdown vault (bidirectional sync)"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.31"]
+
+[project.scripts]
+notion-iwe = "notion_iwe_sync.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["notion_iwe_sync"]
