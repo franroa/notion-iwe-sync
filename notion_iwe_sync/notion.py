@@ -75,7 +75,14 @@ class Notion:
             cursor = d["next_cursor"]
 
     def delete_block(self, block_id: str):
-        self.req("DELETE", f"/blocks/{block_id}")
+        try:
+            self.req("DELETE", f"/blocks/{block_id}")
+        except RuntimeError as e:
+            # idempotent delete: the block being gone already is success
+            msg = str(e)
+            if "archived" in msg or "-> 404" in msg:
+                return
+            raise
 
     def append(self, block_id: str, blocks: list[dict]):
         for i in range(0, len(blocks), 100):

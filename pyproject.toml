@@ -1,6 +1,6 @@
 [project]
 name = "notion-iwe-sync"
-version = "0.1.0"
+version = "0.2.0"
 description = "Mirror a personal Notion workspace as a local IWE markdown vault (bidirectional sync)"
 requires-python = ">=3.11"
 dependencies = ["requests>=2.31"]

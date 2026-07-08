@@ -19,6 +19,15 @@ Notion page  ⇄  ~/notion/<slug>-<id8>.md
 
 ## Install
 
+From a checkout, the installer sets up everything (CLI, config template, systemd user unit):
+
+```bash
+./install.sh            # install; prints the remaining manual steps
+./install.sh --enable   # install and start the watch daemon right away
+```
+
+Or by hand:
+
 ```bash
 uv tool install notion-iwe-sync        # or: pipx install notion-iwe-sync
 # from a checkout:
@@ -52,7 +61,7 @@ If the vault should be an IWE workspace, drop your `.iwe/config.toml` inside it 
 | Command | What it does |
 | --- | --- |
 | `notion-iwe pull` | Notion → vault. Fetches every page the integration can see; only pages whose `last_edited_time` changed are rewritten. **Remote wins** — if the local copy also changed, it is backed up to `.conflicts/` first. |
-| `notion-iwe push` | vault → Notion. Pushes every file whose content hash differs from the last sync. **Local wins** — if the remote page also changed, its version is backed up to `.conflicts/` first. |
+| `notion-iwe push` | vault → Notion. Pushes every file whose content hash differs from the last sync. **Local wins** — if the remote page also changed, its version is backed up to `.conflicts/` first. `--force` re-pushes every local file regardless of the hash, and `notion-iwe push <file.md> [...]` re-pushes just the named file(s) — both heal local/remote drift. Pages archived (trashed) on the Notion side are skipped. |
 | `notion-iwe sync` | `pull` then `push`. |
 | `notion-iwe watch` | Daemon: pushes ~3 s after a file is saved (debounced), pulls every `pull_interval` seconds. |
 | `notion-iwe status` | Shows the vault path, tracked page count, and which files would be pushed. |
@@ -97,6 +106,13 @@ notion-url: https://www.notion.so/Workflow-36b4c85ae57d80f7ace7db3db90a778e
 **State.** `~/.local/state/notion-iwe/state.json` records, per page: the file name, the
 remote `last_edited_time`, and the local content hash. That's how each direction knows
 what changed — and how a push avoids re-triggering the next pull.
+
+**Concurrency.** Every pull/push takes an exclusive file lock
+(`~/.local/state/notion-iwe/lock`) and re-reads the state file first, so the watch daemon
+and a manual CLI invocation can never replace the same page's blocks at the same time
+(previously that race could leave a page truncated). Block deletion is idempotent — a
+block already deleted by a competing writer is not an error. After each push the block
+count is verified against what was sent; on mismatch a warning suggests `push --force`.
 
 **Conflicts.** The direction that runs decides (pull → remote wins, push → local wins),
 and the other side's version is written to `<vault>/.conflicts/<name>-<timestamp>.md`.

@@ -8,12 +8,14 @@ watch  daemon: push on file save, pull every N seconds
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import re
 import sys
 import time
 import tomllib
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +23,24 @@ from .notion import Notion, blocks_to_md, md_to_blocks, page_title
 
 CONFIG = Path.home() / ".config/notion-iwe/config.toml"
 STATE = Path.home() / ".local/state/notion-iwe/state.json"
+LOCK = STATE.parent / "lock"
+
+
+@contextmanager
+def locked():
+    """Cross-process mutex around any pull/push.
+
+    The watch daemon and a manual CLI invocation may run at the same time; without
+    this, both replace the same page's blocks concurrently and one aborts between
+    delete and append, leaving the page truncated.
+    """
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOCK, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def log(msg: str):
@@ -135,8 +155,10 @@ def local_files(vault: Path):
     return sorted(p for p in vault.glob("*.md") if not p.name.startswith("."))
 
 
-def changed_files(cfg: dict, st: dict) -> list[Path]:
+def changed_files(cfg: dict, st: dict, force: bool = False) -> list[Path]:
     vault = Path(cfg["vault"])
+    if force:
+        return local_files(vault)
     by_file = {v["file"]: (k, v) for k, v in st["pages"].items()}
     out = []
     for f in local_files(vault):
@@ -170,6 +192,9 @@ def push_file(api: Notion, cfg: dict, st: dict, fpath: Path) -> bool:
         log(f"  + created page for {fpath.name}")
 
     page = api.get_page(pid)
+    if page.get("archived") or page.get("in_trash"):
+        log(f"  - {fpath.name}: remote page is archived/in trash — skipped")
+        return False
     known = st["pages"].get(page["id"])
     if known and known.get("last_edited") != page["last_edited_time"]:
         # remote changed since our last sync -> keep a copy of the remote before clobbering
@@ -179,7 +204,12 @@ def push_file(api: Notion, cfg: dict, st: dict, fpath: Path) -> bool:
         api.set_title(page, title)
     for b in api.children(pid):
         api.delete_block(b["id"])
-    api.append(pid, md_to_blocks(md_body, url_map))
+    blocks = md_to_blocks(md_body, url_map)
+    api.append(pid, blocks)
+    remote_n = sum(1 for _ in api.children(pid))
+    if remote_n != len(blocks):
+        log(f"  ⚠ {fpath.name}: remote has {remote_n} top-level blocks, expected "
+            f"{len(blocks)} — verify the page; `notion-iwe push --force` re-pushes it")
     page = api.get_page(pid)  # re-read for the post-push last_edited_time
     st["pages"][page["id"]] = {"file": fpath.name,
                                "last_edited": page["last_edited_time"],
@@ -189,8 +219,19 @@ def push_file(api: Notion, cfg: dict, st: dict, fpath: Path) -> bool:
     return True
 
 
-def push(api: Notion, cfg: dict, st: dict):
-    files = changed_files(cfg, st)
+def push(api: Notion, cfg: dict, st: dict, force: bool = False,
+         only: list[str] | None = None):
+    if only:
+        vault = Path(cfg["vault"])
+        files = []
+        for name in only:
+            f = vault / (name if name.endswith(".md") else f"{name}.md")
+            if not f.exists():
+                log(f"  ✗ {f.name}: not found in vault")
+                continue
+            files.append(f)
+    else:
+        files = changed_files(cfg, st, force=force)
     if not files:
         log("push — nothing changed")
         return
@@ -203,12 +244,25 @@ def push(api: Notion, cfg: dict, st: dict):
 
 # --------------- watch ---------------
 
-def watch(api: Notion, cfg: dict, st: dict):
+def pull_op(api: Notion, cfg: dict):
+    """Locked pull with state re-read, safe against concurrent CLI/daemon runs."""
+    with locked():
+        pull(api, cfg, load_state())
+
+
+def push_op(api: Notion, cfg: dict, force: bool = False,
+            only: list[str] | None = None):
+    """Locked push with state re-read, safe against concurrent CLI/daemon runs."""
+    with locked():
+        push(api, cfg, load_state(), force=force, only=only)
+
+
+def watch(api: Notion, cfg: dict):
     vault = Path(cfg["vault"])
     interval = int(cfg["pull_interval"])
     log(f"watching {vault} (push on save, pull every {interval}s)")
     try:
-        pull(api, cfg, st)
+        pull_op(api, cfg)
     except Exception as e:
         log(f"initial pull failed: {e}")
     last_pull = time.time()
@@ -223,14 +277,14 @@ def watch(api: Notion, cfg: dict, st: dict):
         if dirty_since and time.time() - dirty_since > 3:  # debounce: quiet for 3s
             dirty_since = None
             try:
-                push(api, cfg, st)
+                push_op(api, cfg)
             except Exception as e:
                 log(f"push failed: {e}")
             mtimes = {f: f.stat().st_mtime for f in local_files(vault)}
         if time.time() - last_pull >= interval:
             last_pull = time.time()
             try:
-                pull(api, cfg, st)
+                pull_op(api, cfg)
             except Exception as e:
                 log(f"pull failed: {e}")
             mtimes = {f: f.stat().st_mtime for f in local_files(vault)}
@@ -240,20 +294,26 @@ def main():
     ap = argparse.ArgumentParser(prog="notion-iwe", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["pull", "push", "sync", "watch", "status"])
+    ap.add_argument("files", nargs="*",
+                    help="push: vault file name(s) to push unconditionally, "
+                         "e.g. `notion-iwe push my-page.md` (heals a single page)")
+    ap.add_argument("--force", action="store_true",
+                    help="push: re-push every local file even if the state hash says "
+                         "it is unchanged (heals local/remote drift)")
     args = ap.parse_args()
     cfg = load_config()
-    st = load_state()
     api = Notion(cfg["token"])
     if args.cmd == "pull":
-        pull(api, cfg, st)
+        pull_op(api, cfg)
     elif args.cmd == "push":
-        push(api, cfg, st)
+        push_op(api, cfg, force=args.force, only=args.files or None)
     elif args.cmd == "sync":
-        pull(api, cfg, st)
-        push(api, cfg, st)
+        pull_op(api, cfg)
+        push_op(api, cfg, force=args.force)
     elif args.cmd == "watch":
-        watch(api, cfg, st)
+        watch(api, cfg)
     elif args.cmd == "status":
+        st = load_state()
         files = changed_files(cfg, st)
         print(f"vault: {cfg['vault']}")
         print(f"tracked pages: {len(st['pages'])}")

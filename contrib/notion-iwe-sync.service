@@ -1,0 +1,11 @@
+[Unit]
+Description=Notion <-> IWE vault bidirectional sync (watch mode)
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/notion-iwe watch
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target
